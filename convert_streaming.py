@@ -118,7 +118,9 @@ def process_tensor_name(name: str, rank: int, mp: int, n_local_experts: int):
 
     # Check if this expert belongs to this rank
     if "experts" in name and "shared_experts" not in name:
-        idx = int(name.split(".")[-3])
+        parts = name.split(".")
+        experts_pos = parts.index("experts")
+        idx = int(parts[experts_pos + 1])
         if idx < rank * n_local_experts or idx >= (rank + 1) * n_local_experts:
             return None
         return name, None
