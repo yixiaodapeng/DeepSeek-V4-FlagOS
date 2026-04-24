@@ -11,6 +11,9 @@
 ### 模型并行分片优化
 `convert.py` 针对 `wo_a` / `wo_b` 权重新增分组投影分片逻辑，支持更大规模的模型并行。
 
+### 流式权重转换（内存优化）
+新增 `convert_streaming.py`，针对超大模型（如 2T 参数）在有限内存下的转换场景进行优化。与 `convert.py` 功能一致，但采用流式处理策略：逐文件读取、按 rank 分别处理、通过临时目录增量保存，避免将所有权重同时加载到内存中。
+
 ---
 
 ## 安装依赖
@@ -36,6 +39,12 @@ python3 -m pip install flagtree===0.5.0 --index-url=https://resource.flagos.net/
 
 ```bash
 python convert.py --hf-ckpt-path ${HF_CKPT_PATH} --save-path ${SAVE_PATH} --n-experts ${EXPERTS} --model-parallel ${MP}
+```
+
+如果内存不足（例如转换超大模型），可使用流式版本：
+
+```bash
+python convert_streaming.py --hf-ckpt-path ${HF_CKPT_PATH} --save-path ${SAVE_PATH} --n-experts ${EXPERTS} --model-parallel ${MP}
 ```
 
 如需使用 FP8 专家权重，去掉 `config_flash_v4.json` 中的 `"expert_dtype": "fp4"` 并在 `convert.py` 中指定 `--expert-dtype fp8`。
