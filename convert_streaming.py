@@ -1,14 +1,17 @@
 """
-Streaming model weight conversion script.
+Streaming model weight conversion script with multiprocessing support.
 
 Features:
-1. Processes files one by one without accumulating all weights in memory
-2. Supports very large models (e.g. 2T params) under limited memory
-3. Uses a temp directory for intermediate results, then merges at the end
+1. Multi-process parallel conversion for speed
+2. Optional --streaming mode for limited-memory machines (uses temp files to avoid holding full shard in memory)
 
 Usage is identical to convert.py:
     python convert_streaming.py --hf-ckpt-path <path> --save-path <path> \
-        --n-experts 256 --model-parallel 8
+        --n-experts 256 --model-parallel 8 --num-workers 4
+
+For low-memory machines, add --streaming:
+    python convert_streaming.py --hf-ckpt-path <path> --save-path <path> \
+        --n-experts 256 --model-parallel 8 --num-workers 4 --streaming
 """
 
 import os
@@ -16,7 +19,8 @@ import shutil
 import tempfile
 from argparse import ArgumentParser
 from glob import glob
-from tqdm import tqdm, trange
+from multiprocessing import Pool
+from tqdm import tqdm
 
 import torch
 from safetensors.torch import safe_open, save_file
@@ -83,7 +87,7 @@ MAPPING = {
 }
 
 
-def process_tensor_name(name: str, rank: int, mp: int, n_local_experts: int):
+def process_tensor_name(name: str, rank: int, mp: int, n_local_experts: int, expert_dtype: str = None):
     """
     Process tensor name and determine whether this rank needs it.
 
@@ -94,16 +98,16 @@ def process_tensor_name(name: str, rank: int, mp: int, n_local_experts: int):
     if name.startswith("model."):
         name = name[len("model."):]
 
-    # Skip MTP embedding and head
     if name.startswith("mtp.") and ("emb" in name or name.endswith("head.weight")):
         return None
 
     name = name.replace("self_attn", "attn")
     name = name.replace("mlp", "ffn")
     name = name.replace("weight_scale_inv", "scale")
+    if expert_dtype == "int8":
+        name = name.replace(".weight.scale", ".scale")
     name = name.replace("e_score_correction_bias", "bias")
 
-    # Extract key for mapping lookup
     if any(x in name for x in ["hc", "attn_sink", "tie2eid", "ape"]):
         key = name.split(".")[-1]
     else:
@@ -116,7 +120,6 @@ def process_tensor_name(name: str, rank: int, mp: int, n_local_experts: int):
 
     name = name.replace(key, new_key)
 
-    # Check if this expert belongs to this rank
     if "experts" in name and "shared_experts" not in name:
         parts = name.split(".")
         experts_pos = parts.index("experts")
@@ -131,33 +134,30 @@ def process_tensor_name(name: str, rank: int, mp: int, n_local_experts: int):
     return name, None
 
 
-def get_sharded_tensor(param: torch.Tensor, slice_info: tuple, name: str) -> torch.Tensor:
+def get_sharded_tensor(param: torch.Tensor, slice_info: tuple, name: str,
+                       use_ogroups_comm: bool, o_groups: int) -> torch.Tensor:
     """Shard tensor according to slice_info."""
     dim, i, mp = slice_info
-    print(f"Processing parameter {name} with shape {param.shape} for model parallel shard {i}")
-    if "wo_a" not in name and "wo_b" not in name:
-        assert param.size(dim) % mp == 0, f"Dimension {dim} must be divisible by {mp}"
-        shard_size = param.size(dim) // mp
-        return param.narrow(dim, i * shard_size, shard_size).contiguous()
-    else:
-        num_projection_groups = mp // 8
+    if use_ogroups_comm and ("wo_a" in name or "wo_b" in name):
+        num_projection_groups = mp // o_groups
         new_mp = mp // num_projection_groups
         new_i = i // num_projection_groups
         shard_size = param.size(dim) // new_mp
-        assert shard_size == 1024
         return param.narrow(dim, new_i * shard_size, shard_size).contiguous()
+    else:
+        assert param.size(dim) % mp == 0, f"Dimension {dim} must be divisible by {mp}"
+        shard_size = param.size(dim) // mp
+        return param.narrow(dim, i * shard_size, shard_size).contiguous()
 
 
-def process_single_file(file_path: str, rank: int, mp: int, n_local_experts: int) -> dict:
-    """
-    Process a single safetensors file and return tensors needed by this rank.
-    Memory is released after processing each file.
-    """
+def process_single_file(file_path: str, rank: int, mp: int, n_local_experts: int,
+                        expert_dtype: str, use_ogroups_comm: bool, o_groups: int) -> dict:
+    """Process a single safetensors file and return tensors needed by this rank."""
     result = {}
 
     with safe_open(file_path, framework="pt", device="cpu") as f:
         for name in f.keys():
-            process_result = process_tensor_name(name, rank, mp, n_local_experts)
+            process_result = process_tensor_name(name, rank, mp, n_local_experts, expert_dtype)
             if process_result is None:
                 continue
 
@@ -165,85 +165,98 @@ def process_single_file(file_path: str, rank: int, mp: int, n_local_experts: int
             param = f.get_tensor(name)
 
             if slice_info is not None:
-                param = get_sharded_tensor(param, slice_info, new_name)
+                param = get_sharded_tensor(param, slice_info, new_name, use_ogroups_comm, o_groups)
 
             result[new_name] = param
 
     return result
 
 
-def incremental_save(tensors: dict, temp_dir: str, batch_idx: int):
-    """Save current batch of tensors to a temp file for later merging."""
-    temp_file = os.path.join(temp_dir, f"batch_{batch_idx}.safetensors")
-    save_file(tensors, temp_file)
-    return temp_file
+def _process_rank(args_tuple):
+    """Worker: process one rank, in-memory mode (fast)."""
+    rank, mp, hf_ckpt_path, save_path, n_experts, expert_dtype, file_paths, threads_per_proc, o_groups, use_ogroups_comm = args_tuple
+    torch.set_num_threads(threads_per_proc)
+    n_local_experts = n_experts // mp
+    state_dict = {}
+
+    for file_path in file_paths:
+        tensors = process_single_file(
+            file_path, rank, mp, n_local_experts,
+            expert_dtype, use_ogroups_comm, o_groups
+        )
+        state_dict.update(tensors)
+        del tensors
+
+    output_file = os.path.join(save_path, f"model{rank}-mp{mp}.safetensors")
+    save_file(state_dict, output_file)
+    return rank
 
 
-def main(hf_ckpt_path: str, save_path: str, n_experts: int, mp: int, expert_dtype: str = None):
-    """
-    Streaming conversion main function.
-
-    Strategy:
-    1. Iterate over all input files, processing one at a time
-    2. For each MP rank, maintain a memory buffer; flush to temp files when buffer is full
-    3. Merge all temp files into the final output
-    """
-    torch.set_num_threads(8)
+def _process_rank_streaming(args_tuple):
+    """Worker: process one rank, streaming mode (low memory)."""
+    rank, mp, hf_ckpt_path, save_path, n_experts, expert_dtype, file_paths, threads_per_proc, o_groups, use_ogroups_comm = args_tuple
+    torch.set_num_threads(threads_per_proc)
     n_local_experts = n_experts // mp
 
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_files = []
+
+        for batch_idx, file_path in enumerate(file_paths):
+            tensors = process_single_file(
+                file_path, rank, mp, n_local_experts,
+                expert_dtype, use_ogroups_comm, o_groups
+            )
+            if tensors:
+                temp_file = os.path.join(temp_dir, f"batch_{batch_idx}.safetensors")
+                save_file(tensors, temp_file)
+                temp_files.append(temp_file)
+                del tensors
+
+        merged = {}
+        for temp_file in temp_files:
+            with safe_open(temp_file, framework="pt", device="cpu") as f:
+                for name in f.keys():
+                    merged[name] = f.get_tensor(name)
+
+        output_file = os.path.join(save_path, f"model{rank}-mp{mp}.safetensors")
+        save_file(merged, output_file)
+
+    return rank
+
+
+def main(hf_ckpt_path: str, save_path: str, n_experts: int, mp: int,
+         expert_dtype: str = None, o_groups: int = 8, num_workers: int = 4,
+         streaming: bool = False):
+    torch.set_num_threads(8)
+
+    use_ogroups_comm = os.getenv("USE_OGROUPS_COMM", "0").lower() in ("1", "true", "yes")
+    if use_ogroups_comm:
+        if mp <= o_groups:
+            raise ValueError(
+                f"USE_OGROUPS_COMM requires model-parallel ({mp}) > o_groups ({o_groups}). "
+                f"Please increase --model-parallel or unset USE_OGROUPS_COMM."
+            )
+
+    file_paths = sorted(glob(os.path.join(hf_ckpt_path, "*.safetensors")))
     os.makedirs(save_path, exist_ok=True)
 
-    input_files = sorted(glob(os.path.join(hf_ckpt_path, "*.safetensors")))
-    if not input_files:
-        raise ValueError(f"No safetensors files found in {hf_ckpt_path}")
+    total_threads = os.cpu_count() or 8
+    threads_per_proc = max(1, total_threads // num_workers)
 
-    print(f"Found {len(input_files)} input files")
-    print(f"Model parallel: {mp}, Local experts per rank: {n_local_experts}")
-    print("Starting streaming conversion...")
+    args_list = [
+        (i, mp, hf_ckpt_path, save_path, n_experts, expert_dtype, file_paths, threads_per_proc, o_groups, use_ogroups_comm)
+        for i in range(mp)
+    ]
 
-    for rank in trange(mp, desc="Processing ranks"):
-        buffer = {}
-        temp_files = []
-        buffer_size = 0
-        batch_counter = 0
-        # 8GB buffer limit (approximate)
-        BUFFER_LIMIT = 8 * 1024**3
+    worker_fn = _process_rank_streaming if streaming else _process_rank
+    mode_str = "streaming" if streaming else "in-memory"
+    print(f"Converting with {num_workers} workers ({mode_str} mode)")
 
-        with tempfile.TemporaryDirectory() as temp_dir:
-            for file_idx, file_path in enumerate(tqdm(
-                input_files,
-                desc=f"Rank {rank}",
-                leave=False
-            )):
-                file_tensors = process_single_file(
-                    file_path, rank, mp, n_local_experts
-                )
+    with Pool(processes=num_workers) as pool:
+        for _ in tqdm(pool.imap_unordered(worker_fn, args_list), total=mp, desc="Converting shards"):
+            pass
 
-                for name, tensor in file_tensors.items():
-                    buffer[name] = tensor
-                    buffer_size += tensor.numel() * tensor.element_size()
-
-                # Flush buffer if it exceeds the limit or this is the last file
-                if buffer_size >= BUFFER_LIMIT or file_idx == len(input_files) - 1:
-                    if buffer:
-                        temp_file = incremental_save(buffer, temp_dir, batch_counter)
-                        temp_files.append(temp_file)
-                        buffer.clear()
-                        buffer_size = 0
-                        batch_counter += 1
-
-            # Merge all temp files into the final output
-            merged = {}
-            for temp_file in temp_files:
-                with safe_open(temp_file, framework="pt", device="cpu") as f:
-                    for name in f.keys():
-                        merged[name] = f.get_tensor(name)
-
-            output_file = os.path.join(save_path, f"model{rank}-mp{mp}.safetensors")
-            save_file(merged, output_file)
-
-    # Copy config files
-    for file in ["chat_template.jinja", "tokenizer.json", "tokenizer_config.json"]:
+    for file in ["tokenizer.json", "tokenizer_config.json"]:
         src = os.path.join(hf_ckpt_path, file)
         dst = os.path.join(save_path, file)
         if os.path.exists(src):
@@ -258,16 +271,13 @@ if __name__ == "__main__":
     parser.add_argument("--save-path", type=str, required=True)
     parser.add_argument("--n-experts", type=int, required=True)
     parser.add_argument("--model-parallel", type=int, required=True)
-    parser.add_argument("--expert-dtype", type=str, choices=["fp8", "fp4"], default=None)
+    parser.add_argument("--expert-dtype", type=str, choices=["fp8", "fp4", "int8"], required=False, default=None)
+    parser.add_argument("--o-groups", type=int, default=8)
+    parser.add_argument("--num-workers", type=int, required=True,
+                        help="Number of parallel processes. Each worker holds one shard in memory.")
+    parser.add_argument("--streaming", action="store_true",
+                        help="Use streaming mode with temp files to reduce memory usage.")
     args = parser.parse_args()
-
-    assert args.n_experts % args.model_parallel == 0, \
-        "Number of experts must be divisible by model parallelism"
-
-    main(
-        args.hf_ckpt_path,
-        args.save_path,
-        args.n_experts,
-        args.model_parallel,
-        args.expert_dtype
-    )
+    assert args.n_experts % args.model_parallel == 0, "Number of experts must be divisible by model parallelism"
+    main(args.hf_ckpt_path, args.save_path, args.n_experts, args.model_parallel,
+         args.expert_dtype, args.o_groups, args.num_workers, args.streaming)

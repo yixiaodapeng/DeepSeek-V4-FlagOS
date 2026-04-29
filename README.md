@@ -12,7 +12,10 @@
 `convert.py` 针对 `wo_a` / `wo_b` 权重新增分组投影分片逻辑，支持更大规模的模型并行。
 
 ### 流式权重转换（内存优化）
-新增 `convert_streaming.py`，针对超大模型（如 2T 参数）在有限内存下的转换场景进行优化。与 `convert.py` 功能一致，但采用流式处理策略：逐文件读取、按 rank 分别处理、通过临时目录增量保存，避免将所有权重同时加载到内存中。
+新增 `convert_streaming.py`，针对超大模型（如 2T 参数）在有限内存下的转换场景进行优化。与 `convert.py` 功能一致，额外支持：
+- 多进程并行转换（`--num-workers`）
+- 可选 `--streaming` 模式，通过临时文件 + 增量保存避免将完整 shard 加载到内存
+- 支持 `--o-groups` 分组投影分片和 `--expert-dtype int8`
 
 ---
 
@@ -44,7 +47,17 @@ python convert.py --hf-ckpt-path ${HF_CKPT_PATH} --save-path ${SAVE_PATH} --n-ex
 如果内存不足（例如转换超大模型），可使用流式版本：
 
 ```bash
-python convert_streaming.py --hf-ckpt-path ${HF_CKPT_PATH} --save-path ${SAVE_PATH} --n-experts ${EXPERTS} --model-parallel ${MP}
+# 多进程并行转换
+python convert_streaming.py --hf-ckpt-path ${HF_CKPT_PATH} --save-path ${SAVE_PATH} \
+    --n-experts ${EXPERTS} --model-parallel ${MP} --num-workers 4
+
+# 低内存流式模式（通过临时文件减少内存占用）
+python convert_streaming.py --hf-ckpt-path ${HF_CKPT_PATH} --save-path ${SAVE_PATH} \
+    --n-experts ${EXPERTS} --model-parallel ${MP} --num-workers 4 --streaming
+
+# 支持 o-groups 分组投影分片（MP > o_groups 时）
+python convert_streaming.py --hf-ckpt-path ${HF_CKPT_PATH} --save-path ${SAVE_PATH} \
+    --n-experts ${EXPERTS} --model-parallel ${MP} --o-groups 8 --num-workers 4
 ```
 
 如需使用 FP8 专家权重，去掉 `config_flash_v4.json` 中的 `"expert_dtype": "fp4"` 并在 `convert.py` 中指定 `--expert-dtype fp8`。
