@@ -1,34 +1,37 @@
-# 基于FlagOS的DeepSeek推理代码
+# DeepSeek Inference Code Based on FlagOS
 
-## 新增功能
+## Features
 
-### FlagGems 加速支持
-通过设置环境变量 `USE_FLAGGEMS=1` 启用 [FlagGems](https://github.com/FlagOpen/FlagGems) 算子加速。
+### FlagGems Acceleration
+Enable [FlagGems](https://github.com/FlagOpen/FlagGems) operator acceleration by setting the environment variable `USE_FLAGGEMS=1`.
 
-### FP8/FP4 → BF16 权重转换工具
-支持将 DeepSeek-V3.2 的量化权重（MXFP4 E2M1 / FP8 E4M3）直接反量化为 BF16 格式，无需依赖 `kernel.py`，纯 PyTorch 实现。
+### O-Groups Grouped Projection Communication
+When the model parallel size (MP) is greater than `o_groups`, set the environment variable `USE_OGROUPS_COMM=1` to enable grouped projection communication optimization for `wo_a` / `wo_b` (pair_comm_group and projection_comm_group). If MP <= o_groups, enabling this option will raise an error.
 
-### 模型并行分片优化
-`convert.py` 针对 `wo_a` / `wo_b` 权重新增分组投影分片逻辑，支持更大规模的模型并行。
+### FP8/FP4 → BF16 Weight Conversion Tool
+Supports dequantizing DeepSeek-V3.2 quantized weights (MXFP4 E2M1 / FP8 E4M3) directly to BF16 format, implemented in pure PyTorch without depending on `kernel.py`.
 
-### 流式权重转换（内存优化）
-新增 `convert_streaming.py`，针对超大模型（如 2T 参数）在有限内存下的转换场景进行优化。与 `convert.py` 功能一致，额外支持：
-- 多进程并行转换（`--num-workers`）
-- 可选 `--streaming` 模式，通过临时文件 + 增量保存避免将完整 shard 加载到内存
-- 支持 `--o-groups` 分组投影分片和 `--expert-dtype int8`
+### INT8 MoE Expert Quantization
+Quantize MoE expert weights from BF16 to INT8 (per-channel symmetric) using `quantize_int8_moe.py`, then run inference with `config_pro_v4_int8.json`.
+
+### Streaming Weight Conversion (Memory-Optimized)
+`convert_streaming.py` is optimized for converting ultra-large models (e.g., 2T parameters) under limited memory. It provides the same functionality as `convert.py`, with additional support for:
+- Multi-process parallel conversion (`--num-workers`)
+- Optional `--streaming` mode that uses temporary files + incremental saving to avoid loading full shards into memory
+- `--o-groups` grouped projection sharding and `--expert-dtype int8`
 
 ---
 
-## 安装依赖
+## Installation
 
 ```bash
-# 安装原始依赖 
+# Install base dependencies
 pip install -r requirements.txt
 
-# 安装 FlagGems
+# Install FlagGems
 pip install flag-gems==5.0.2
 
-# 安装FlagTree, 以英伟达平台为例, 其他芯片请参考https://github.com/flagos-ai/flagtree：
+# Install FlagTree (NVIDIA platform example; for other chips see https://github.com/flagos-ai/flagtree):
 python3 -m pip uninstall -y triton
 python3 -m pip install flagtree===0.5.0 --index-url=https://resource.flagos.net/repository/flagos-pypi-hosted/simple
 
@@ -36,74 +39,106 @@ python3 -m pip install flagtree===0.5.0 --index-url=https://resource.flagos.net/
 
 ---
 
-## 参数转换
+## Weight Conversion
 
-### 方式一：从 HuggingFace 格式转换（原始流程）
+### Option 1: Convert from HuggingFace Format (Standard Flow)
 
 ```bash
 python convert.py --hf-ckpt-path ${HF_CKPT_PATH} --save-path ${SAVE_PATH} --n-experts ${EXPERTS} --model-parallel ${MP}
 ```
 
-如果内存不足（例如转换超大模型），可使用流式版本：
+When MP > o_groups and grouped projection communication is needed:
 
 ```bash
-# 多进程并行转换
+export USE_OGROUPS_COMM=1
+python convert.py --hf-ckpt-path ${HF_CKPT_PATH} --save-path ${SAVE_PATH} --n-experts ${EXPERTS} --model-parallel ${MP} --o-groups 8
+```
+
+If memory is insufficient (e.g., converting ultra-large models), use the streaming version:
+
+```bash
+# Multi-process parallel conversion
 python convert_streaming.py --hf-ckpt-path ${HF_CKPT_PATH} --save-path ${SAVE_PATH} \
     --n-experts ${EXPERTS} --model-parallel ${MP} --num-workers 4
 
-# 低内存流式模式（通过临时文件减少内存占用）
+# Low-memory streaming mode (reduces memory usage via temporary files)
 python convert_streaming.py --hf-ckpt-path ${HF_CKPT_PATH} --save-path ${SAVE_PATH} \
     --n-experts ${EXPERTS} --model-parallel ${MP} --num-workers 4 --streaming
 
-# 支持 o-groups 分组投影分片（MP > o_groups 时）
+# With o-groups grouped projection sharding (when MP > o_groups)
 python convert_streaming.py --hf-ckpt-path ${HF_CKPT_PATH} --save-path ${SAVE_PATH} \
     --n-experts ${EXPERTS} --model-parallel ${MP} --o-groups 8 --num-workers 4
 ```
 
-如需使用 FP8 专家权重，去掉 `config_flash_v4.json` 中的 `"expert_dtype": "fp4"` 并在 `convert.py` 中指定 `--expert-dtype fp8`。
+To use FP8 expert weights, remove `"expert_dtype": "fp4"` from `config_flash_v4.json` and specify `--expert-dtype fp8` in `convert.py`.
 
-### 方式二：FP8/FP4 量化权重转 BF16（新增）
+### Option 2: FP8/FP4 Quantized Weights → BF16
 
-按参考convert_weight.sh脚本流程执行：
+Follow the convert_weight.sh script:
 
 ```bash
-# Step1: fp4/fp8 -> bf16
+# Step 1: fp4/fp8 -> bf16
 python3 convert_weight.py \
-    --input-fp8-hf-path path-to-fp4-or-fp8-ckpt \
+    --input-fp4-hf-path path-to-fp4-or-fp8-ckpt \
     --output-bf16-hf-path path-to-bf16-ckpt
 
-# Step2: bf16 -> bf16-mp16
+# Step 2: bf16 -> bf16-mp16
 export MP=16
 export HF_CKPT_PATH=path-to-bf16-ckpt
 export SAVE_PATH=path-to-bf16-mp16-ckpt
 
 export EXPERTS=256
-python convert.py --hf-ckpt-path ${HF_CKPT_PATH} --save-path ${SAVE_PATH} --n-experts ${EXPERTS} --model-parallel ${MP}
+export USE_OGROUPS_COMM=1
+python convert.py --hf-ckpt-path ${HF_CKPT_PATH} --save-path ${SAVE_PATH} --n-experts ${EXPERTS} --model-parallel ${MP} --o-groups 8
 ```
+
+### Option 3: INT8 MoE Expert Quantization (BF16 → INT8)
+
+Quantize MoE expert weights to INT8, then shard for model-parallel inference.
+
+```bash
+# Step 1: Quantize expert weights BF16 -> INT8
+python3 quantize_int8_moe.py \
+    --input_dir path-to-bf16-hf-ckpt \
+    --output_dir path-to-int8-hf-ckpt \
+    --config_path config_pro_v4_int8.json
+
+# Step 2: Shard for model-parallel
+export MP=16
+python convert.py \
+    --hf-ckpt-path path-to-int8-hf-ckpt \
+    --save-path path-to-int8-mp16-ckpt \
+    --n-experts 384 \
+    --model-parallel ${MP} \
+    --expert-dtype int8 \
+    --o-groups 16
+```
+
+Use `config_pro_v4_int8.json` for inference, which includes `quantization_config` to enable INT8 dequantization at runtime.
 
 ---
 
-## 推理
+## Inference
 
-### 交互式对话
+### Interactive Chat
 
 ```bash
 torchrun --nproc-per-node ${MP} generate.py --ckpt-path ${SAVE_PATH} --config ${CONFIG} --interactive --temperature ${T}
 ```
 
-### 文件批量推理
+### Batch Inference from File
 
 ```bash
 torchrun --nproc-per-node ${MP} generate.py --ckpt-path ${SAVE_PATH} --config ${CONFIG} --input-file ${FILE}
 ```
 
-### 单节点 8-GPU（MP8，启用 FlagGems）
+### Single Node 8-GPU (MP8, with FlagGems)
 
 ```bash
 bash run_mp8.sh
 ```
 
-等价命令：
+Equivalent command:
 
 ```bash
 export USE_FLAGGEMS=1
@@ -114,25 +149,51 @@ torchrun --nproc-per-node 8 generate.py \
     --ckpt-path path-to-bf16-mp8-ckpt
 ```
 
-### 双节点 16-GPU（MP16，启用 FlagGems）
+Note: MP=8 equals the default o_groups=8, which does not meet the USE_OGROUPS_COMM requirement, so it should not be set.
 
-在 node 0 上运行：
+### Two-Node 16-GPU (MP16, with FlagGems + O-Groups Communication)
+
+On node 0:
 
 ```bash
 bash run_node_0.sh
 ```
 
-在 node 1 上运行：
+On node 1:
 
 ```bash
 bash run_node_1.sh
 ```
 
-运行前需在脚本中将 `--master_addr` 和 `--master_port` 替换为实际地址。
+Replace `--master_addr` and `--master_port` in the scripts with actual values before running. MP=16 > o_groups=8, so `USE_OGROUPS_COMM=1` is already set in the scripts.
 
-### 通用多节点推理
+### General Multi-Node Inference
 
 ```bash
+# When MP > o_groups, add: export USE_OGROUPS_COMM=1
 torchrun --nnodes ${NODES} --nproc-per-node $((MP / NODES)) --node-rank $RANK --master-addr $ADDR \
     generate.py --ckpt-path ${SAVE_PATH} --config ${CONFIG} --input-file ${FILE}
 ```
+
+### INT8 Quantized Model Inference
+
+```bash
+# Use config_pro_v4_int8.json which contains quantization_config
+torchrun --nproc-per-node ${MP} generate.py \
+    --ckpt-path path-to-int8-mp16-ckpt \
+    --config config_pro_v4_int8.json \
+    --input-file prompt.txt
+```
+
+---
+
+## Config Reference
+
+| Config | Model | expert_dtype | quantization_config | Description |
+|--------|-------|-------------|---------------------|-------------|
+| `config_flash_v4.json` | V4-Flash | fp4 | — | Flash model, 256 experts, o_groups=8 |
+| `config_pro_v4.json` | V4-Pro | fp4 | — | Pro model, 384 experts, o_groups=16 |
+| `config_pro_v4_int8.json` | V4-Pro | fp4 | linear_int8 | Pro model with INT8 quantized MoE experts |
+
+- `expert_dtype`: controls how expert weights are stored on disk (fp4/fp8/int8)
+- `quantization_config`: when present, enables INT8 dequantization for MoE experts at runtime
